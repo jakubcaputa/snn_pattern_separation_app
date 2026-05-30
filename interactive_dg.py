@@ -256,6 +256,36 @@ def make_input_spikes(pattern_active_tuple, seed=1042):
     return np.array([], dtype=np.int32), np.array([])
 
 
+@st.cache_data(show_spinner=False)
+def make_input_spikes_per_fiber(pattern_active_tuple, n_syn_pp, r_fiber, r_fiber_bg, seed=1042):
+    """
+    Per-fiber Poisson (jak Madar): n_syn_pp niezależnych włókien PP na każdy GC.
+    Aktywne GC: każde włókno strzela z r_fiber Hz.
+    Nieaktywne GC: każde włókno strzela z r_fiber_bg Hz.
+    Indeksy w [0, N_GC*n_syn_pp - 1]: włókno f GC i → idx = i*n_syn_pp + f.
+    """
+    pattern_active = np.array(pattern_active_tuple)
+    N_GC = len(pattern_active)
+    rng = np.random.default_rng(seed)
+    n_steps = int(T_MS_POP / DT_MS)
+    all_idx, all_t = [], []
+    for i, active in enumerate(pattern_active):
+        rate = r_fiber if active else r_fiber_bg
+        p = rate * DT_MS * 1e-3
+        for f in range(n_syn_pp):
+            ts = np.where(rng.random(n_steps) < p)[0].astype(float) * DT_MS
+            ts = ts[(ts > 0) & (ts < T_MS_POP)]
+            if len(ts):
+                all_idx.append(np.full(len(ts), i * n_syn_pp + f, dtype=np.int32))
+                all_t.append(ts)
+    if all_idx:
+        idx = np.concatenate(all_idx)
+        t   = np.concatenate(all_t)
+        order = np.argsort(t)
+        return idx[order], t[order]
+    return np.array([], dtype=np.int32), np.array([])
+
+
 def _izh_eqs(a, b, tau_ex, tau_in=None, K_tonic=0.0):
     inh_eq   = f"\ndg_in/dt = -g_in / ({tau_in}*ms) : volt" if tau_in else ""
     inh_term = "- g_in/ms " if tau_in else ""
@@ -281,7 +311,8 @@ def simulate_brian(gc_input_idx, gc_input_t_ms, conn, N_GC, N_FS, N_HMC,
                    enable_ff, enable_fb, enable_hmc,
                    W_PP_GC, W_PP_FS, W_GC_FS, W_FS_GC,
                    W_GC_HMC, W_HMC_FS, W_HMC_GC,
-                   K_GC, K_FS, K_HMC):
+                   K_GC, K_FS, K_HMC,
+                   per_fiber=False, n_syn_pp=40):
     start_scope()
     defaultclock.dt = DT_MS * ms
     T_MS = T_MS_POP
@@ -290,7 +321,8 @@ def simulate_brian(gc_input_idx, gc_input_t_ms, conn, N_GC, N_FS, N_HMC,
     fs_eqs  = _izh_eqs(A_FS,  B_FS,  TAU_EX_FS,  tau_in=None,       K_tonic=K_FS)
     hmc_eqs = _izh_eqs(A_HMC, B_HMC, TAU_EX_HMC, tau_in=None,       K_tonic=K_HMC)
 
-    pp = SpikeGeneratorGroup(N_GC, gc_input_idx, gc_input_t_ms * ms)
+    n_pp_neurons = N_GC * n_syn_pp if per_fiber else N_GC
+    pp = SpikeGeneratorGroup(n_pp_neurons, gc_input_idx, gc_input_t_ms * ms)
 
     gc = NeuronGroup(N_GC, gc_eqs,
                      threshold='v >= 30*mV',
@@ -310,14 +342,30 @@ def simulate_brian(gc_input_idx, gc_input_t_ms, conn, N_GC, N_FS, N_HMC,
     hmc.v = -70*mV;  hmc.u = B_HMC * (-70*mV);  hmc.g_ex = 0*mV
 
     net_objs = [pp, gc, fs, hmc]
-    syn_pp_gc = Synapses(pp, gc, on_pre=f'g_ex_post += {W_PP_GC}*mV',
-                         delay=PP_DELAY * ms)
-    syn_pp_gc.connect(i=np.arange(N_GC), j=np.arange(N_GC))
-    net_objs.append(syn_pp_gc)
 
-    if enable_ff:
-        s = _syn(pp, fs, conn['pp_fs'][0], conn['pp_fs'][1], W_PP_FS, 'g_ex', PP_DELAY)
-        if s is not None: net_objs.append(s)
+    if per_fiber:
+        # n_syn_pp niezależnych włókien PP na GC: włókno f GC i → index i*n_syn_pp + f
+        pp_gc_src = np.repeat(np.arange(N_GC, dtype=np.int32) * n_syn_pp, n_syn_pp) + \
+                    np.tile(np.arange(n_syn_pp, dtype=np.int32), N_GC)
+        pp_gc_tgt = np.repeat(np.arange(N_GC, dtype=np.int32), n_syn_pp)
+        syn_pp_gc = Synapses(pp, gc, on_pre=f'g_ex_post += {W_PP_GC}*mV',
+                             delay=PP_DELAY * ms)
+        syn_pp_gc.connect(i=pp_gc_src, j=pp_gc_tgt)
+        net_objs.append(syn_pp_gc)
+        if enable_ff:
+            # PP→FS: użyj włókna 0 każdego GC z istniejącej macierzy połączeń
+            pp_fs_src = conn['pp_fs'][0] * n_syn_pp
+            s = _syn(pp, fs, pp_fs_src, conn['pp_fs'][1], W_PP_FS, 'g_ex', PP_DELAY)
+            if s is not None: net_objs.append(s)
+    else:
+        syn_pp_gc = Synapses(pp, gc, on_pre=f'g_ex_post += {W_PP_GC}*mV',
+                             delay=PP_DELAY * ms)
+        syn_pp_gc.connect(i=np.arange(N_GC), j=np.arange(N_GC))
+        net_objs.append(syn_pp_gc)
+        if enable_ff:
+            s = _syn(pp, fs, conn['pp_fs'][0], conn['pp_fs'][1], W_PP_FS, 'g_ex', PP_DELAY)
+            if s is not None: net_objs.append(s)
+
     if enable_fb:
         s = _syn(gc, fs, conn['gc_fs'][0], conn['gc_fs'][1], W_GC_FS, 'g_ex', SYN_DELAY)
         if s is not None: net_objs.append(s)
@@ -479,6 +527,27 @@ with st.sidebar:
         N_patterns = st.slider("Liczba wzorców",                2,    5,    3,    step=1)
 
         st.markdown("---")
+        st.header("Model sygnału PP")
+        input_mode = st.radio(
+            "Typ wejścia PP",
+            ["Zagregowany (szybszy)", "Per-fiber (jak Madar)"],
+            help="Per-fiber: każdy GC dostaje n_syn_pp niezależnych włókien PP ~10 Hz, "
+                 "jak w pracy Madara. Wolniejszy, ale biofizycznie wierniejszy.")
+        per_fiber = (input_mode == "Per-fiber (jak Madar)")
+        if per_fiber:
+            n_syn_pp   = st.slider("n_syn_pp  (włókna PP / GC)", 5, 80, 40, step=5)
+            r_fiber    = st.slider("r_fiber  (Hz / włókno, aktywne GC)", 1.0, 30.0, 10.0, step=1.0)
+            r_fiber_bg = st.slider("r_fiber_bg  (Hz / włókno, nieaktywne GC)", 0.1, 5.0, 1.0, step=0.1)
+            st.caption(f"Łączna częst. aktywnego GC: **{n_syn_pp * r_fiber:.0f} Hz** "
+                       f"(vs zagregowane {R_EFF_HIGH:.0f} Hz). "
+                       f"Zalecane W PP→GC ≈ {R_EFF_HIGH / (n_syn_pp * r_fiber) * 4:.1f} mV "
+                       f"aby zachować ten sam drive.")
+        else:
+            n_syn_pp   = 1
+            r_fiber    = R_EFF_HIGH
+            r_fiber_bg = R_EFF_LOW
+
+        st.markdown("---")
         st.header("Pobudliwość (K_tonic)")
         K_GC  = st.slider("K_tonic GC",  0.0, 20.0, 10.0, step=1.0)
         K_FS  = st.slider("K_tonic FS",  0.0, 15.0,  5.0, step=1.0)
@@ -496,7 +565,10 @@ else:
     params_key = ("pop", N_GC, N_FS, N_HMC, enable_ff, enable_fb, enable_hmc,
                   round(W_PP_GC,2), round(W_PP_FS,3), round(W_GC_FS,1), round(W_FS_GC,2),
                   round(R_in,2), round(P_active,2), N_patterns,
-                  round(K_GC,1), round(K_FS,1), round(K_HMC,1))
+                  round(K_GC,1), round(K_FS,1), round(K_HMC,1),
+                  per_fiber, n_syn_pp if per_fiber else 0,
+                  round(r_fiber, 1) if per_fiber else 0,
+                  round(r_fiber_bg, 2) if per_fiber else 0)
 
 if "results" not in st.session_state:
     st.session_state.results  = None
@@ -549,12 +621,17 @@ if run_btn or st.session_state.last_key != params_key:
 
         for k in range(N_patterns):
             prog.progress(k/N_patterns, text=f"Wzorzec {k+1}/{N_patterns}…")
-            idx, t_ms = make_input_spikes(tuple(pats[k].tolist()), seed=1042+k)
+            if per_fiber:
+                idx, t_ms = make_input_spikes_per_fiber(
+                    tuple(pats[k].tolist()), n_syn_pp, r_fiber, r_fiber_bg, seed=1042+k)
+            else:
+                idx, t_ms = make_input_spikes(tuple(pats[k].tolist()), seed=1042+k)
             gc_i,gc_t,fs_i,fs_t,hmc_i,hmc_t = simulate_brian(
                 idx, t_ms, conn, N_GC, N_FS, N_HMC,
                 enable_ff, enable_fb, enable_hmc,
                 W_PP_GC, W_PP_FS, W_GC_FS, W_FS_GC,
-                W_GC_HMC, W_HMC_FS, W_HMC_GC, K_GC, K_FS, K_HMC)
+                W_GC_HMC, W_HMC_FS, W_HMC_GC, K_GC, K_FS, K_HMC,
+                per_fiber=per_fiber, n_syn_pp=n_syn_pp)
             gc_sp.append((gc_i,gc_t)); fs_sp.append((fs_i,fs_t)); hmc_sp.append((hmc_i,hmc_t))
 
         prog.progress(1.0, text="Obliczanie metryk…")
@@ -572,6 +649,8 @@ if run_btn or st.session_state.last_key != params_key:
             elapsed=time.time()-t0,
             N_GC=N_GC, N_FS=N_FS, N_HMC=N_HMC, N_patterns=N_patterns,
             enable_ff=enable_ff, enable_fb=enable_fb, enable_hmc=enable_hmc,
+            per_fiber=per_fiber, n_syn_pp=n_syn_pp,
+            r_fiber=r_fiber, r_fiber_bg=r_fiber_bg,
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -684,6 +763,12 @@ else:
 
     with col_metrics:
         st.subheader("Wyniki")
+        if res['per_fiber']:
+            st.info(f"**Model PP: per-fiber** — {res['n_syn_pp']} włókien/GC × "
+                    f"{res['r_fiber']:.0f} Hz (aktywne) / {res['r_fiber_bg']:.1f} Hz (nieaktywne)")
+        else:
+            st.info(f"**Model PP: zagregowany** — {R_EFF_HIGH:.0f} Hz (aktywne) / "
+                    f"{R_EFF_LOW:.0f} Hz (nieaktywne)")
         m1,m2,m3,m4 = st.columns(4)
         m1.metric("FR GC",  f"{res['fr_gc']:.1f} Hz")
         m2.metric("FR FS",  f"{res['fr_fs']:.1f} Hz")
