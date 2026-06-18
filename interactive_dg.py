@@ -190,8 +190,11 @@ TAU_EX_HMC = 5.0
 PP_DELAY   = 4.0
 SYN_DELAY  = 1.0
 
-R_EFF_HIGH = 600.0
-R_EFF_LOW  =  40.0
+# Reżim częstotliwości wejścia PP — z jedynego źródła prawdy (dg_params.py).
+# Kanon: 400/40 Hz aggregate (= 40 włókien × 10/1 Hz), output GC ~6 Hz.
+from dg_params import (
+    N_FIBERS_PER_GC, R_FIBER_ACTIVE, R_FIBER_BG, R_EFF_HIGH, R_EFF_LOW,
+)
 
 P_PP_FS  = 0.40
 P_GC_FS  = 0.40
@@ -286,14 +289,20 @@ def make_input_spikes_per_fiber(pattern_active_tuple, n_syn_pp, r_fiber, r_fiber
     return np.array([], dtype=np.int32), np.array([])
 
 
-def _izh_eqs(a, b, tau_ex, tau_in=None, K_tonic=0.0):
+def _izh_eqs(a, b, tau_ex, tau_in=None, K_tonic=0.0, second_ex_tau=None):
+    """
+    second_ex_tau: jeśli podane, dodaje DRUGI kanał pobudzający g_ex2 (np. dla GC:
+    g_ex = PP→GC, g_ex2 = HMC→GC) — pozwala rozbić budżet napięcia na źródła.
+    """
     inh_eq   = f"\ndg_in/dt = -g_in / ({tau_in}*ms) : volt" if tau_in else ""
     inh_term = "- g_in/ms " if tau_in else ""
     K_term   = f"- {K_tonic}*mV/ms" if K_tonic != 0.0 else ""
+    ex2_eq   = f"\ndg_ex2/dt = -g_ex2 / ({second_ex_tau}*ms) : volt" if second_ex_tau else ""
+    ex2_term = "+ g_ex2/ms " if second_ex_tau else ""
     return (
         f"dv/dt  = (0.04/mV/ms * v**2 + 5/ms * v + 140*mV/ms"
-        f" - u/ms + g_ex/ms {inh_term}{K_term}) : volt (unless refractory)\n"
-        f"dg_ex/dt = -g_ex / ({tau_ex}*ms) : volt{inh_eq}\n"
+        f" - u/ms + g_ex/ms {ex2_term}{inh_term}{K_term}) : volt (unless refractory)\n"
+        f"dg_ex/dt = -g_ex / ({tau_ex}*ms) : volt{ex2_eq}{inh_eq}\n"
         f"du/dt  = {a}/ms * ({b} * v - u) : volt\n"
     )
 
@@ -312,13 +321,25 @@ def simulate_brian(gc_input_idx, gc_input_t_ms, conn, N_GC, N_FS, N_HMC,
                    W_PP_GC, W_PP_FS, W_GC_FS, W_FS_GC,
                    W_GC_HMC, W_HMC_FS, W_HMC_GC,
                    K_GC, K_FS, K_HMC,
-                   per_fiber=False, n_syn_pp=40):
+                   per_fiber=False, n_syn_pp=40,
+                   budget_active_idx=None, budget_inact_idx=None):
     start_scope()
     defaultclock.dt = DT_MS * ms
     T_MS = T_MS_POP
 
-    gc_eqs  = _izh_eqs(A_GC,  B_GC,  TAU_EX_GC,  tau_in=TAU_IN_GC, K_tonic=K_GC)
-    fs_eqs  = _izh_eqs(A_FS,  B_FS,  TAU_EX_FS,  tau_in=None,       K_tonic=K_FS)
+    # GC: dwa kanały pobudzające — g_ex (PP→GC) i g_ex2 (HMC→GC) — dla rozbicia budżetu
+    gc_eqs  = _izh_eqs(A_GC,  B_GC,  TAU_EX_GC,  tau_in=TAU_IN_GC, K_tonic=K_GC,
+                       second_ex_tau=TAU_EX_GC)
+    # FS: TRZY osobne kanały pobudzające — g_ex (PP→FS), g_ex2 (GC→FS), g_ex3 (HMC→FS)
+    # — by zmierzyć przepływ z każdej ścieżki osobno (do schematu).
+    fs_eqs  = (
+        f"dv/dt = (0.04/mV/ms*v**2 + 5/ms*v + 140*mV/ms - u/ms"
+        f" + g_ex/ms + g_ex2/ms + g_ex3/ms - {K_FS}*mV/ms) : volt (unless refractory)\n"
+        f"dg_ex/dt  = -g_ex /({TAU_EX_FS}*ms) : volt\n"
+        f"dg_ex2/dt = -g_ex2/({TAU_EX_FS}*ms) : volt\n"
+        f"dg_ex3/dt = -g_ex3/({TAU_EX_FS}*ms) : volt\n"
+        f"du/dt = {A_FS}/ms*({B_FS}*v - u) : volt\n"
+    )
     hmc_eqs = _izh_eqs(A_HMC, B_HMC, TAU_EX_HMC, tau_in=None,       K_tonic=K_HMC)
 
     n_pp_neurons = N_GC * n_syn_pp if per_fiber else N_GC
@@ -337,8 +358,8 @@ def simulate_brian(gc_input_idx, gc_input_t_ms, conn, N_GC, N_FS, N_HMC,
                       reset=f'v = {C_HMC}*mV; u = u + {D_HMC}*mV',
                       refractory=2*ms, method='euler')
 
-    gc.v  = -70*mV;  gc.u  = B_GC  * (-70*mV);  gc.g_ex  = 0*mV;  gc.g_in = 0*mV
-    fs.v  = -70*mV;  fs.u  = B_FS  * (-70*mV);  fs.g_ex  = 0*mV
+    gc.v  = -70*mV;  gc.u  = B_GC  * (-70*mV);  gc.g_ex  = 0*mV;  gc.g_ex2 = 0*mV;  gc.g_in = 0*mV
+    fs.v  = -70*mV;  fs.u  = B_FS  * (-70*mV);  fs.g_ex  = 0*mV;  fs.g_ex2 = 0*mV;  fs.g_ex3 = 0*mV
     hmc.v = -70*mV;  hmc.u = B_HMC * (-70*mV);  hmc.g_ex = 0*mV
 
     net_objs = [pp, gc, fs, hmc]
@@ -367,7 +388,8 @@ def simulate_brian(gc_input_idx, gc_input_t_ms, conn, N_GC, N_FS, N_HMC,
             if s is not None: net_objs.append(s)
 
     if enable_fb:
-        s = _syn(gc, fs, conn['gc_fs'][0], conn['gc_fs'][1], W_GC_FS, 'g_ex', SYN_DELAY)
+        # GC→FS do osobnego kanału g_ex2 (feedback), by zmierzyć go niezależnie od PP→FS
+        s = _syn(gc, fs, conn['gc_fs'][0], conn['gc_fs'][1], W_GC_FS, 'g_ex2', SYN_DELAY)
         if s is not None: net_objs.append(s)
     if enable_ff or enable_fb:
         s = _syn(fs, gc, conn['fs_gc'][0], conn['fs_gc'][1], W_FS_GC, 'g_in', SYN_DELAY)
@@ -375,20 +397,64 @@ def simulate_brian(gc_input_idx, gc_input_t_ms, conn, N_GC, N_FS, N_HMC,
     if enable_hmc:
         s = _syn(gc,  hmc, conn['gc_hmc'][0], conn['gc_hmc'][1], W_GC_HMC, 'g_ex', SYN_DELAY)
         if s is not None: net_objs.append(s)
-        s = _syn(hmc, fs,  conn['hmc_fs'][0], conn['hmc_fs'][1], W_HMC_FS, 'g_ex', SYN_DELAY)
+        # HMC→FS do osobnego kanału g_ex3
+        s = _syn(hmc, fs,  conn['hmc_fs'][0], conn['hmc_fs'][1], W_HMC_FS, 'g_ex3', SYN_DELAY)
         if s is not None: net_objs.append(s)
-        s = _syn(hmc, gc,  conn['hmc_gc'][0], conn['hmc_gc'][1], W_HMC_GC, 'g_ex', SYN_DELAY)
+        # HMC→GC trafia do osobnego kanału g_ex2 (re-ekscytacja MC widoczna w budżecie)
+        s = _syn(hmc, gc,  conn['hmc_gc'][0], conn['hmc_gc'][1], W_HMC_GC, 'g_ex2', SYN_DELAY)
         if s is not None: net_objs.append(s)
 
     sm_gc  = SpikeMonitor(gc)
     sm_fs  = SpikeMonitor(fs)
     sm_hmc = SpikeMonitor(hmc)
     net_objs += [sm_gc, sm_fs, sm_hmc]
+
+    # Nagraj przewodności KAŻDEJ ścieżki (osobne kanały) na całych populacjach —
+    # z tego liczymy: (1) budżet napięcia GC (przebieg dla aktywnych/nieaktywnych),
+    # (2) flow_meas = średni (po populacji i czasie) przepływ z każdego połączenia
+    # do schematu — wartości MIERZONE z symulacji, nie ze wzoru.
+    budget = None
+    flow_meas = None
+    record = budget_active_idx is not None and len(budget_active_idx)
+    if record:
+        stm_gc  = StateMonitor(gc,  ['v', 'g_ex', 'g_ex2', 'g_in'], record=True)
+        stm_fs  = StateMonitor(fs,  ['g_ex', 'g_ex2', 'g_ex3'],     record=True)
+        stm_hmc = StateMonitor(hmc, ['g_ex'],                       record=True)
+        net_objs += [stm_gc, stm_fs, stm_hmc]
+
     Network(*net_objs).run(T_MS * ms)
+
+    if record:
+        act   = np.asarray(budget_active_idx, dtype=int)
+        inact = np.asarray([] if budget_inact_idx is None else budget_inact_idx, dtype=int)
+        gpp   = np.array(stm_gc.g_ex  / mV)     # PP→GC   (N_GC, n_steps)
+        ghmc  = np.array(stm_gc.g_ex2 / mV)     # HMC→GC
+        gin   = np.array(stm_gc.g_in  / mV)     # FS→GC
+        vrec  = np.array(stm_gc.v     / mV)
+        budget = dict(
+            t=np.array(stm_gc.t / ms),
+            gpp_act=gpp[act].mean(0),  ghmc_act=ghmc[act].mean(0),
+            gin_act=gin[act].mean(0),  v_act=vrec[act].mean(0),
+            v_inact=(vrec[inact].mean(0) if inact.size else None),
+        )
+        # flow_meas: średni przepływ [mV] na ścieżkę, MIERZONY z symulacji.
+        # Ścieżki → GC liczone po AKTYWNYCH GC (spójnie z budżetem napięcia);
+        # ścieżki → FS/HMC po całej populacji celu.
+        gfs   = np.array(stm_fs.g_ex  / mV)     # PP→FS
+        gfs2  = np.array(stm_fs.g_ex2 / mV)     # GC→FS
+        gfs3  = np.array(stm_fs.g_ex3 / mV)     # HMC→FS
+        ghmcg = np.array(stm_hmc.g_ex / mV)     # GC→HMC
+        _m = lambda a: float(a.mean()) if a.size else 0.0
+        flow_meas = {
+            'pp_gc': _m(gpp[act]), 'hmc_gc': _m(ghmc[act]), 'fs_gc': _m(gin[act]),
+            'pp_fs': _m(gfs), 'gc_fs': _m(gfs2),  'hmc_fs': _m(gfs3),
+            'gc_hmc': _m(ghmcg),
+        }
 
     return (np.array(sm_gc.i),  np.array(sm_gc.t  / ms),
             np.array(sm_fs.i),  np.array(sm_fs.t  / ms),
-            np.array(sm_hmc.i), np.array(sm_hmc.t / ms))
+            np.array(sm_hmc.i), np.array(sm_hmc.t / ms),
+            budget, flow_meas)
 
 
 def bin_spikes(i_arr, t_arr, N, bin_ms=100.0):
@@ -420,17 +486,19 @@ CPOS = {'PP': np.array([1.8,5.0]), 'GC': np.array([5.0,5.0]),
         'FS': np.array([7.6,7.6]), 'HMC': np.array([7.6,2.4])}
 CRAD = {'PP':0.68, 'GC':1.00, 'FS':0.72, 'HMC':0.62}
 CFC  = {'PP':COL_PP, 'GC':COL_GC, 'FS':COL_FS, 'HMC':COL_HMC}
+# crv = krzywizna łuku; pary dwukierunkowe (GC↔FS, GC↔HMC) mają przeciwne znaki
+# i dużą wartość, by były to DWA wyraźnie rozdzielone łuki, nie jedna strzałka.
 CCONN = [
     ('pp_gc','PP','GC','ex', 0.00), ('pp_fs','PP','FS','ex', 0.15),
-    ('gc_fs','GC','FS','ex', 0.28), ('fs_gc','FS','GC','in',-0.28),
-    ('gc_hmc','GC','HMC','ex',0.28),('hmc_fs','HMC','FS','ex',0.00),
-    ('hmc_gc','HMC','GC','ex',-0.28),
+    ('gc_fs','GC','FS','ex', 0.40), ('fs_gc','FS','GC','in',-0.40),
+    ('gc_hmc','GC','HMC','ex',0.40),('hmc_fs','HMC','FS','ex',0.00),
+    ('hmc_gc','HMC','GC','ex',-0.40),
 ]
 CONN_LABELS = {
-    'pp_gc' :('PP→GC\nAMPA',   (3.4,5.75)), 'pp_fs' :('PP→FS\nAMPA',   (3.7,7.10)),
-    'gc_fs' :('GC→FS\nAMPA',   (6.95,6.80)),'fs_gc' :('FS→GC\nGABA-A', (5.65,5.65)),
-    'gc_hmc':('GC→HMC\nAMPA',  (7.05,3.25)),'hmc_fs':('HMC→FS\nAMPA',  (8.25,5.00)),
-    'hmc_gc':('HMC→GC\nAMPA',  (5.65,3.25)),
+    'pp_gc' :('PP→GC',   (3.4,5.75)), 'pp_fs' :('PP→FS',   (3.7,7.10)),
+    'gc_fs' :('GC→FS',   (6.95,6.85)),'fs_gc' :('FS→GC',   (5.55,5.55)),
+    'gc_hmc':('GC→HMC',  (7.15,3.35)),'hmc_fs':('HMC→FS',  (8.30,5.00)),
+    'hmc_gc':('HMC→GC',  (5.45,3.25)),
 }
 
 def _cactive(cid, ff, fb, hmc):
@@ -440,7 +508,22 @@ def _cactive(cid, ff, fb, hmc):
     if cid == 'fs_gc': return ff or fb
     return hmc
 
-def draw_circuit(ax, ff, fb, hmc, N_GC, N_FS, N_HMC):
+
+def compute_flows(res):
+    """
+    Przepływ ładunku przez każde połączenie — wartości MIERZONE z symulacji:
+    średnia (po komórkach-celach i po czasie) przewodności dostarczonej przez
+    daną ścieżkę (`flow_meas` z simulate_brian; osobny kanał syn. na ścieżkę).
+    Zwraca (val, lw): słownik wartości [mV] + słownik grubości linii (1–5.5,
+    kompresja sqrt, by słabe przepływy pozostały widoczne).
+    """
+    val = res.get('flow_meas') or {}
+    mx = max(val.values()) if val and max(val.values()) > 0 else 1.0
+    lw = {cid: 1.0 + 4.5 * (v / mx) ** 0.5 for cid, v in val.items() if v > 0}
+    return val, lw
+
+
+def draw_circuit(ax, ff, fb, hmc, N_GC, N_FS, N_HMC, flow_val=None, flow_lw=None):
     ax.set_xlim(0,10); ax.set_ylim(0,10); ax.set_aspect('equal'); ax.axis('off')
     counts = {'PP':'40 wł.','GC':f'N={N_GC}','FS':f'N={N_FS}','HMC':f'N={N_HMC}'}
     labels = {'PP':'PP\n(wejście)','GC':'GC','FS':'FS','HMC':'HMC'}
@@ -452,17 +535,29 @@ def draw_circuit(ax, ff, fb, hmc, N_GC, N_FS, N_HMC):
         active = _cactive(cid, ff, fb, hmc)
         p1, p2 = CPOS[src], CPOS[dst]
         u = (p2-p1)/np.linalg.norm(p2-p1)
-        start = tuple(p1 + CRAD[src]*u); end = tuple(p2 - CRAD[dst]*u)
+        perp = np.array([-u[1], u[0]])      # wektor prostopadły do linii połączenia
+        # KAŻDE połączenie = osobna strzałka jednokierunkowa (-> pobudzenie, -[ hamowanie).
+        # Pary dwukierunkowe (GC↔FS, GC↔HMC) rozsuwamy na DWA równoległe pasy: offset
+        # liczony z kierunku src→dst, więc A→B i B→A trafiają po przeciwnych stronach.
+        OFF = 0.26 if crv != 0 else 0.0
+        start = tuple(p1 + CRAD[src]*u + OFF*perp)
+        end   = tuple(p2 - CRAD[dst]*u + OFF*perp)
         color = (COL_EX if stype=='ex' else COL_IN) if active else COL_DIM
+        lw = (flow_lw.get(cid, 1.8) if flow_lw else 1.8) if active else 0.8
         ax.add_patch(FancyArrowPatch(start, end,
             arrowstyle='->' if stype=='ex' else '-[', color=color,
-            linewidth=1.8 if active else 0.8, alpha=1.0 if active else 0.28,
-            connectionstyle=f'arc3,rad={crv}', mutation_scale=12, zorder=4))
+            linewidth=lw, alpha=1.0 if active else 0.30,
+            connectionstyle=f'arc3,rad={0.12*np.sign(crv)}', mutation_scale=13, zorder=4))
         if cid in CONN_LABELS:
             lbl,(tx,ty) = CONN_LABELS[cid]
-            ax.text(tx,ty,lbl, fontsize=4.8, ha='center', va='center', color=color, zorder=7,
+            # Dopisz wartość przepływu ładunku [mV] ze znakiem (+ pobudza, − hamuje)
+            if active and flow_val and cid in flow_val:
+                sign = '−' if stype == 'in' else '+'
+                lbl = f"{lbl}\n{sign}{flow_val[cid]:.1f} mV"
+            ax.text(tx,ty,lbl, fontsize=4.6, ha='center', va='center', color=color, zorder=7,
+                    fontweight='bold' if active else 'normal',
                     bbox=dict(boxstyle='round,pad=0.15', fc='white', ec=color, lw=0.4,
-                              alpha=0.88 if active else 0.35))
+                              alpha=0.90 if active else 0.35))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -518,7 +613,15 @@ with st.sidebar:
         W_PP_FS = st.slider("W PP→FS  (siła FF)",     0.05, 2.0,  0.25, step=0.05)
         W_GC_FS = st.slider("W GC→FS  (siła FB)",     1.0, 30.0, 10.0, step=1.0)
         W_FS_GC = st.slider("W FS→GC  (hamowanie)",   0.1,  5.0,  1.0, step=0.1)
-        W_GC_HMC = 1.0;  W_HMC_FS = 1.0;  W_HMC_GC = 0.5
+        with st.expander("Wagi Mossy Cells (HMC)", expanded=True):
+            st.caption("Domyślnie HMC są prawie ciche: rzadko strzelające GC dają zbyt "
+                       "mały napęd **W GC→HMC** względem progu (G_crit = 4 + K_HMC = 14 mV). "
+                       "Aby je aktywować, zwiększ **W GC→HMC** (≈10–16) lub zmniejsz "
+                       "**K_HMC**; wtedy w budżecie napięcia urośnie pomarańczowe pole "
+                       "**W HMC→GC** (re-ekscytacja MC).")
+            W_GC_HMC = st.slider("W GC→HMC  (napęd MC)",        0.5, 20.0,  1.0, step=0.5)
+            W_HMC_FS = st.slider("W HMC→FS  (MC wzmacnia FS)",  0.0, 10.0,  1.0, step=0.5)
+            W_HMC_GC = st.slider("W HMC→GC  (re-ekscytacja MC)", 0.0,  5.0,  0.5, step=0.1)
 
         st.markdown("---")
         st.header("Parametry wejściowe")
@@ -535,9 +638,9 @@ with st.sidebar:
                  "jak w pracy Madara. Wolniejszy, ale biofizycznie wierniejszy.")
         per_fiber = (input_mode == "Per-fiber (jak Madar)")
         if per_fiber:
-            n_syn_pp   = st.slider("n_syn_pp  (włókna PP / GC)", 5, 80, 40, step=5)
-            r_fiber    = st.slider("r_fiber  (Hz / włókno, aktywne GC)", 1.0, 30.0, 10.0, step=1.0)
-            r_fiber_bg = st.slider("r_fiber_bg  (Hz / włókno, nieaktywne GC)", 0.1, 5.0, 1.0, step=0.1)
+            n_syn_pp   = st.slider("n_syn_pp  (włókna PP / GC)", 5, 80, N_FIBERS_PER_GC, step=5)
+            r_fiber    = st.slider("r_fiber  (Hz / włókno, aktywne GC)", 1.0, 30.0, R_FIBER_ACTIVE, step=1.0)
+            r_fiber_bg = st.slider("r_fiber_bg  (Hz / włókno, nieaktywne GC)", 0.1, 5.0, R_FIBER_BG, step=0.1)
             st.caption(f"Łączna częst. aktywnego GC: **{n_syn_pp * r_fiber:.0f} Hz** "
                        f"(vs zagregowane {R_EFF_HIGH:.0f} Hz). "
                        f"Zalecane W PP→GC ≈ {R_EFF_HIGH / (n_syn_pp * r_fiber) * 4:.1f} mV "
@@ -564,6 +667,7 @@ if mode == "🧠 Pojedynczy neuron (LIF)":
 else:
     params_key = ("pop", N_GC, N_FS, N_HMC, enable_ff, enable_fb, enable_hmc,
                   round(W_PP_GC,2), round(W_PP_FS,3), round(W_GC_FS,1), round(W_FS_GC,2),
+                  round(W_GC_HMC,2), round(W_HMC_FS,2), round(W_HMC_GC,2),
                   round(R_in,2), round(P_active,2), N_patterns,
                   round(K_GC,1), round(K_FS,1), round(K_HMC,1),
                   per_fiber, n_syn_pp if per_fiber else 0,
@@ -618,6 +722,8 @@ if run_btn or st.session_state.last_key != params_key:
         conn = make_connectivity(N_GC, N_FS, N_HMC)
         pats, r_in_actual = make_patterns_pop(N_GC, N_patterns, R_in, P_active)
         gc_sp, fs_sp, hmc_sp = [], [], []
+        budget0 = None     # budżet napięcia dla wzorca 1
+        flow_meas0 = None  # zmierzone przepływy (do schematu) dla wzorca 1
 
         for k in range(N_patterns):
             prog.progress(k/N_patterns, text=f"Wzorzec {k+1}/{N_patterns}…")
@@ -626,12 +732,24 @@ if run_btn or st.session_state.last_key != params_key:
                     tuple(pats[k].tolist()), n_syn_pp, r_fiber, r_fiber_bg, seed=1042+k)
             else:
                 idx, t_ms = make_input_spikes(tuple(pats[k].tolist()), seed=1042+k)
-            gc_i,gc_t,fs_i,fs_t,hmc_i,hmc_t = simulate_brian(
+
+            # Dla 1. wzorca nagraj budżet napięcia ≤30 aktywnych i ≤30 nieaktywnych GC
+            if k == 0:
+                act   = np.where(pats[0])[0][:30].astype(int)
+                inact = np.where(~pats[0])[0][:30].astype(int)
+            else:
+                act = inact = None
+
+            gc_i,gc_t,fs_i,fs_t,hmc_i,hmc_t,budget,flow_meas = simulate_brian(
                 idx, t_ms, conn, N_GC, N_FS, N_HMC,
                 enable_ff, enable_fb, enable_hmc,
                 W_PP_GC, W_PP_FS, W_GC_FS, W_FS_GC,
                 W_GC_HMC, W_HMC_FS, W_HMC_GC, K_GC, K_FS, K_HMC,
-                per_fiber=per_fiber, n_syn_pp=n_syn_pp)
+                per_fiber=per_fiber, n_syn_pp=n_syn_pp,
+                budget_active_idx=act, budget_inact_idx=inact)
+            if k == 0:
+                budget0 = budget
+                flow_meas0 = flow_meas
             gc_sp.append((gc_i,gc_t)); fs_sp.append((fs_i,fs_t)); hmc_sp.append((hmc_i,hmc_t))
 
         prog.progress(1.0, text="Obliczanie metryk…")
@@ -651,6 +769,8 @@ if run_btn or st.session_state.last_key != params_key:
             enable_ff=enable_ff, enable_fb=enable_fb, enable_hmc=enable_hmc,
             per_fiber=per_fiber, n_syn_pp=n_syn_pp,
             r_fiber=r_fiber, r_fiber_bg=r_fiber_bg,
+            budget=budget0, flow_meas=flow_meas0,
+            K_GC=K_GC, K_FS=K_FS, K_HMC=K_HMC,
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -741,15 +861,21 @@ else:
 
     with col_circ:
         st.subheader("Schemat obwodu")
+        flow_val, flow_lw = compute_flows(res)
         fig_c, ax_c = plt.subplots(figsize=(4, 4))
         draw_circuit(ax_c, res['enable_ff'], res['enable_fb'], res['enable_hmc'],
-                     N_GC_r, N_FS_r, N_HMC_r)
+                     N_GC_r, N_FS_r, N_HMC_r, flow_val=flow_val, flow_lw=flow_lw)
         ax_c.legend(handles=[
             mpatches.Patch(color=COL_EX, label='Pobudzające (AMPA)'),
             mpatches.Patch(color=COL_IN, label='Hamujące (GABA-A)'),
             mpatches.Patch(color=COL_DIM, label='Nieaktywne'),
         ], fontsize=5.5, loc='lower left', framealpha=0.9)
         fig_c.tight_layout(); st.pyplot(fig_c, use_container_width=True); plt.close(fig_c)
+        st.caption("Każda strzałka = jeden kierunek (→ pobudza, ⊣ hamuje); połączenia "
+                   "dwukierunkowe (GC↔FS, GC↔HMC) to dwie osobne strzałki. Grubość oraz "
+                   "liczba [mV] = przepływ ZMIERZONY z symulacji (średnia przewodności w "
+                   "czasie; ścieżki→GC po aktywnych GC, spójnie z budżetem; →FS/HMC po "
+                   "całej populacji). Znak +/− = pobudza/hamuje.")
 
         cname = ("full"     if res['enable_ff'] and res['enable_fb']
                  else "ff_only" if res['enable_ff']
@@ -769,41 +895,118 @@ else:
         else:
             st.info(f"**Model PP: zagregowany** — {R_EFF_HIGH:.0f} Hz (aktywne) / "
                     f"{R_EFF_LOW:.0f} Hz (nieaktywne)")
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("FR GC",  f"{res['fr_gc']:.1f} Hz")
-        m2.metric("FR FS",  f"{res['fr_fs']:.1f} Hz")
-        m3.metric("R_in → R_out", f"{res['r_in']:.2f} → {res['r_out']:.2f}")
-        m4.metric("Dekorelajcja", f"{res['dec']:+.3f}", delta=f"{res['elapsed']:.1f}s")
+        m1,m2,m3,m4,m5,m6 = st.columns(6)
+        m1.metric("FR GC",  f"{res['fr_gc']:.1f} Hz",
+                  delta=("rzadkie ✓" if res['fr_gc'] <= 10 else "za gęste ✗"),
+                  delta_color="off",
+                  help="DG koduje rzadko: aktywne GC ~1–10 Hz.")
+        m2.metric("FR FS",  f"{res['fr_fs']:.1f} Hz",
+                  delta=("gamma ✓" if 30 <= res['fr_fs'] <= 100
+                         else ("za wolno" if res['fr_fs'] < 30 else "za szybko")),
+                  delta_color="off",
+                  help="Interneurony FS powinny strzelać w paśmie gamma 30–100 Hz.")
+        m3.metric("FR HMC", f"{res['fr_hmc']:.1f} Hz",
+                  delta=("aktywne" if res['fr_hmc'] >= 0.5 else "~ciche"),
+                  delta_color="off",
+                  help="Mossy cells — w domyślnym setupie często prawie nieaktywne.")
+        m4.metric("R_in → R_out", f"{res['r_in']:.2f} → {res['r_out']:.2f}")
+        m5.metric("Dekorelacja", f"{res['dec']:+.3f}")
+        m6.metric("Czas", f"{res['elapsed']:.1f}s")
 
-        # Raster plots
+        # Raster plots — N_patterns wzorców UŁOŻONYCH PIONOWO (każdy w osobnym pasmie).
+        # Oś Y pokazuje numer wzorca (Wz.k), NIE surowy indeks neuronu, bo pasma są
+        # przesunięte o offset (inaczej oś sięgałaby N_patterns × N_neuronów).
         fig_r, axes = plt.subplots(3, 1, figsize=(9, 5.5), sharex=True,
-                                   gridspec_kw={'hspace':0.10})
-        for k,(gc_i,gc_t) in enumerate(res['gc_spikes']):
-            axes[0].scatter(gc_t, gc_i + k*(N_GC_r+6), s=0.8,
-                            color=PAT_COLORS[k], alpha=0.7, linewidths=0,
-                            label=f'Wzorzec {k+1}')
-        axes[0].set_ylabel("GC neuron",fontsize=8)
-        axes[0].set_title("Raster — Granule Cells (GC)", fontsize=9, fontweight='bold')
-        axes[0].set_ylim(-5, res['N_patterns']*(N_GC_r+6))
-        axes[0].legend(loc='upper right', fontsize=6.5, markerscale=5)
-        axes[0].spines[['top','right']].set_visible(False)
+                                   gridspec_kw={'hspace':0.18})
 
-        for k,(fs_i,fs_t) in enumerate(res['fs_spikes']):
-            axes[1].scatter(fs_t, fs_i + k*(N_FS_r+3), s=1.5,
-                            color=PAT_COLORS[k], alpha=0.8, linewidths=0)
-        axes[1].set_ylabel("FS neuron",fontsize=8)
-        axes[1].set_title("Raster — FS Interneurons", fontsize=9, fontweight='bold')
-        axes[1].set_ylim(-2, res['N_patterns']*(N_FS_r+3))
-        axes[1].spines[['top','right']].set_visible(False)
+        def _draw_raster(ax, spikes, N_cells, gap, title, size, legend=False):
+            band = N_cells + gap
+            for k, (ci, ct) in enumerate(spikes):
+                ax.scatter(ct, ci + k * band, s=size, color=PAT_COLORS[k],
+                           alpha=0.75, linewidths=0,
+                           label=f'Wzorzec {k+1}' if legend else None)
+                if k > 0:                                   # linia rozdzielająca pasma
+                    ax.axhline(k * band - gap / 2, color='lightgray', lw=0.6, zorder=0)
+            ax.set_ylim(-gap, res['N_patterns'] * band)
+            ax.set_yticks([k * band + N_cells / 2 for k in range(res['N_patterns'])])
+            ax.set_yticklabels([f'Wz.{k+1}\n(0–{N_cells})' for k in range(res['N_patterns'])],
+                               fontsize=6)
+            ax.set_title(title, fontsize=9, fontweight='bold')
+            ax.spines[['top', 'right']].set_visible(False)
+            if legend:
+                ax.legend(loc='upper right', fontsize=6.5, markerscale=5)
 
-        for k,(hmc_i,hmc_t) in enumerate(res['hmc_spikes']):
-            axes[2].scatter(hmc_t, hmc_i + k*(N_HMC_r+2), s=1.5,
-                            color=PAT_COLORS[k], alpha=0.8, linewidths=0)
-        axes[2].set_ylabel("HMC neuron",fontsize=8)
-        axes[2].set_xlabel("Czas (ms)",fontsize=8)
-        axes[2].set_title("Raster — Hilar Mossy Cells (HMC)", fontsize=9, fontweight='bold')
-        axes[2].set_xlim(0, T_MS_POP); axes[2].spines[['top','right']].set_visible(False)
+        _draw_raster(axes[0], res['gc_spikes'],  N_GC_r,  6,
+                     f"Raster — Granule Cells (GC), N={N_GC_r}",  0.8, legend=True)
+        _draw_raster(axes[1], res['fs_spikes'],  N_FS_r,  3,
+                     f"Raster — FS Interneurons, N={N_FS_r}",     1.5)
+        _draw_raster(axes[2], res['hmc_spikes'], N_HMC_r, 2,
+                     f"Raster — Hilar Mossy Cells (HMC), N={N_HMC_r}", 1.5)
+        axes[2].set_xlabel("Czas (ms)", fontsize=8)
+        axes[2].set_xlim(0, T_MS_POP)
+        # Adnotacja gdy HMC milczą — żeby pusty panel nie mylił
+        if res['fr_hmc'] < 0.05:
+            axes[2].text(0.5, 0.5, 'HMC nieaktywne (0 Hz) — patrz panel „Rola Mossy Cells”',
+                         transform=axes[2].transAxes, ha='center', va='center',
+                         fontsize=8, color='gray', style='italic')
         fig_r.tight_layout(); st.pyplot(fig_r, use_container_width=True); plt.close(fig_r)
+
+    # ── Budżet napięcia GC: kto pobudza, a kto hamuje ─────────────────────────
+    st.subheader("Co pobudza, a co hamuje GC?  (budżet napięcia)")
+    bud = res.get('budget')
+    if bud is None:
+        st.caption("Brak danych budżetu napięcia (żaden GC nie był aktywny we wzorcu 1).")
+    else:
+        G_crit = 4.0 + res['K_GC']
+        fig_b, (axb1, axb2) = plt.subplots(2, 1, figsize=(11, 4.6), sharex=True,
+                                           gridspec_kw={'hspace':0.12})
+        t    = bud['t']
+        gpp  = bud['gpp_act']; ghmc = bud['ghmc_act']; gin = bud['gin_act']
+        net  = gpp + ghmc - gin
+        # Pobudzenie ułożone warstwowo: PP (zielony) + HMC→GC (pomarańcz) ku górze
+        axb1.fill_between(t, 0, gpp, color=COL_PP, alpha=0.40,
+                          label='Pobudzenie PP→GC  (+g_ex)')
+        axb1.fill_between(t, gpp, gpp + ghmc, color=COL_HMC, alpha=0.55,
+                          label='Pobudzenie HMC→GC  (+g_ex2, re-ekscytacja MC)')
+        axb1.fill_between(t, 0, -gin, color=COL_IN, alpha=0.35,
+                          label='Hamowanie FS→GC  (−g_in)')
+        axb1.plot(t, net, color=COL_EX, lw=1.1, label='Napęd netto (PP+HMC−FS)')
+        axb1.axhline(G_crit, color='crimson', ls='--', lw=1.0,
+                     label=f'G_crit ≈ {G_crit:.0f} mV (próg, K_GC={res["K_GC"]:.0f})')
+        axb1.axhline(0, color='gray', lw=0.6)
+        axb1.set_ylabel('Wkład do V [mV]', fontsize=8)
+        axb1.set_title('Uśredniony wkład synaptyczny wg ŹRÓDŁA — aktywne GC (wzorzec 1)',
+                       fontsize=9, fontweight='bold')
+        axb1.legend(fontsize=6.0, loc='upper right', ncol=2)
+        axb1.spines[['top','right']].set_visible(False)
+
+        axb2.plot(t, bud['v_act'], color=COL_GC, lw=0.7, label='V_m aktywne GC (śred.)')
+        if bud.get('v_inact') is not None:
+            axb2.plot(t, bud['v_inact'], color=COL_DIM, lw=0.7, label='V_m nieaktywne GC (śred.)')
+        axb2.set_ylabel('V_m [mV]', fontsize=8); axb2.set_xlabel('Czas (ms)', fontsize=8)
+        axb2.set_xlim(0, T_MS_POP)
+        axb2.legend(fontsize=6.5, loc='upper right')
+        axb2.spines[['top','right']].set_visible(False)
+        fig_b.tight_layout(); st.pyplot(fig_b, use_container_width=True); plt.close(fig_b)
+        st.caption("Zielone = pobudzenie PP→GC; pomarańczowe = re-ekscytacja HMC→GC "
+                   "(jeśli pole jest cienkie, mossy cells prawie nie dokładają); "
+                   "fioletowe = hamowanie FS→GC. Czarna linia = napęd netto; im częściej "
+                   "przebija G_crit, tym częściej GC odpala. Wyłącz FF/FB lub HMC w panelu "
+                   "bocznym, by zobaczyć wkład każdego źródła z osobna.")
+
+        # Diagnoza roli mossy cells (P4)
+        ghmc_mean = float(np.mean(bud['ghmc_act']))
+        if not res['enable_hmc']:
+            mc_msg = "HMC wyłączone (odznaczone w panelu bocznym)."
+        elif res['fr_hmc'] < 0.5:
+            mc_msg = (f"HMC praktycznie **ciche** ({res['fr_hmc']:.2f} Hz) → re-ekscytacja "
+                      f"HMC→GC ≈ {ghmc_mean:.2f} mV (znikoma). Aby je ożywić: zwiększ "
+                      f"**W GC→HMC** lub zmniejsz **K_HMC** (próg = 4+K_HMC).")
+        else:
+            mc_msg = (f"HMC **aktywne** ({res['fr_hmc']:.1f} Hz) → re-ekscytacja HMC→GC ≈ "
+                      f"{ghmc_mean:.2f} mV (pomarańczowe pole); równolegle HMC→FS wzmacnia "
+                      f"hamowanie. Netto efekt MC widać porównując R_out z/bez HMC.")
+        st.info("**Rola Mossy Cells:** " + mc_msg)
 
     # Aktywność populacyjna
     st.subheader("Aktywność populacyjna w czasie")
